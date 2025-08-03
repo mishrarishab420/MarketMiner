@@ -1,0 +1,25 @@
+# ---- Core ----
+streamlit
+pandas
+numpy
+
+# ---- Scraping ----
+requests
+beautifulsoup4
+lxml
+selenium
+undetected-chromedriver
+
+# ---- Visualization ----
+plotly
+matplotlib
+seaborn
+altair
+
+# ---- Excel / CSV Handling ----
+openpyxl
+xlsxwriter
+
+# ---- Utilities ----
+tqdm
+python-dotenv
