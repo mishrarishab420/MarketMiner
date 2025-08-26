@@ -16,7 +16,6 @@ st.set_page_config(
 )
 
 # Compact CSS with Tighter Spacing
-# Compact CSS with Tighter Spacing
 st.markdown("""
     <style>
         :root {
