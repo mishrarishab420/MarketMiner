@@ -4,8 +4,11 @@ import numpy as np
 import time
 import plotly.express as px
 from datetime import datetime
+import os
+import sys
+import threading
+from scraping.amazon_scrapper import scrape_amazon
 
-# ---------------------------
 # App Configuration
 # ---------------------------
 st.set_page_config(
@@ -33,7 +36,7 @@ st.markdown("""
         }
         
         .main {
-            padding-top: 0.5rem !important;  /* Reduced from 1rem */
+            padding-top: 0.5rem !important;
             margin-bottom: 0rem;
         }
         
@@ -58,7 +61,6 @@ st.markdown("""
             margin-top: 0.5rem;
         }
         
-        /* Compact cards */
         .card {
             background-color: var(--card-bg);
             border-radius: 12px;
@@ -68,12 +70,10 @@ st.markdown("""
             margin-bottom: 1rem !important;
         }
         
-        /* Tighten header spacing */
         .header-container {
             margin-bottom: 0.5rem !important;
         }
         
-        /* Compact tabs */
         .stTabs [data-baseweb="tab-list"] {
             gap: 0.5rem;
         }
@@ -83,66 +83,20 @@ st.markdown("""
             border-radius: 8px;
         }
         
-        /* Compact data tables */
         .dataframe {
             margin: 0.5rem 0 !important;
         }
         
-        /* Remove extra padding in columns */
         [data-testid="column"] {
             padding: 0.5rem !important;
         }
         
-        /* Tighten metric spacing */
         [data-testid="stMetric"] {
             padding: 0.5rem !important;
         }
     </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------
-# Sample Data Generator (unchanged)
-# ---------------------------
-def generate_sample_data(query, website):
-    """Generate realistic sample e-commerce data for demonstration"""
-    np.random.seed(42)
-    
-    products = {
-        "iPhone": ["iPhone 15 Pro", "iPhone 14", "iPhone SE"],
-        "Smartwatch": ["Apple Watch Ultra", "Samsung Galaxy Watch", "Fitbit Sense"],
-        "T-shirt": ["Cotton Polo T-Shirt", "Graphic Tee", "Athletic Dry-Fit"]
-    }
-    
-    # Get relevant products based on query
-    product_type = next((k for k in products if k.lower() in query.lower()), "iPhone")
-    product_list = products.get(product_type, products["iPhone"])
-    
-    # Generate 10 items (3 full sets of products plus 1 extra)
-    num_items = 10
-    repeated_products = (product_list * (num_items // len(product_list) + 1))[:num_items]
-    
-    # Generate data with consistent lengths
-    data = pd.DataFrame({
-        "Product": [f"{p} ({website})" for p in repeated_products],
-        "Price (₹)": np.random.randint(
-            10000, 150000, num_items) if product_type == "iPhone" 
-            else np.random.randint(5000, 35000, num_items) if product_type == "Smartwatch"
-            else np.random.randint(300, 2000, num_items),
-        "Rating": np.round(np.random.uniform(3.5, 5, num_items), 1),
-        "Reviews": np.random.randint(50, 2000, num_items),
-        "Seller": ["Official Store" if x%3==0 else "Premium Reseller" if x%3==1 else "Marketplace Seller" 
-                  for x in range(num_items)],
-        "In Stock": [True if x%4!=0 else False for x in range(num_items)],
-        "Discount %": np.random.randint(0, 40, num_items),
-        "Scraped At": [datetime.now().strftime("%Y-%m-%d %H:%M") for _ in range(num_items)]
-    })
-    
-    # Add some outliers
-    if len(data) > 3:
-        data.loc[3, "Price (₹)"] = data["Price (₹)"].max() * 1.8
-        data.loc[7, "Rating"] = data["Rating"].min() * 0.9
-    
-    return data.sort_values("Price (₹)")
 
 # ---------------------------
 # Compact Header Section
@@ -162,8 +116,40 @@ st.markdown("""
 
 st.markdown("---")
 
+# Initialize session state for scraper
+if 'scraping_in_progress' not in st.session_state:
+    st.session_state.scraping_in_progress = False
+if 'scraping_complete' not in st.session_state:
+    st.session_state.scraping_complete = False
+if 'scraped_data' not in st.session_state:
+    st.session_state.scraped_data = None
+if 'progress' not in st.session_state:
+    st.session_state.progress = 0
+
+# Function to run scraper in a thread
+# In your run_scraper function
+def run_scraper(query, pages):
+    try:
+        st.session_state.scraping_in_progress = True
+        st.session_state.scraping_complete = False
+        
+        # Create a progress callback function
+        def progress_callback(progress):
+            st.session_state.progress = progress
+        
+        # Run the scraper
+        df = scrape_amazon(query, pages, progress_callback)
+        
+        st.session_state.scraped_data = df
+        st.session_state.scraping_complete = True
+        st.session_state.scraping_in_progress = False
+        
+    except Exception as e:
+        st.error(f"Error during scraping: {str(e)}")
+        st.session_state.scraping_in_progress = False
+
 # ---------------------------
-# Sidebar Configuration (more compact)
+# Sidebar Configuration
 # ---------------------------
 with st.sidebar:
     st.markdown("""
@@ -188,17 +174,24 @@ with st.sidebar:
         
         query = st.text_input(
             "SEARCH QUERY:",
-            value="iPhone 15",
             placeholder="e.g. iPhone 15, Smartwatch, T-shirt"
         )
         
-        with st.expander("⚙️ Advanced Settings", expanded=False):
-            st.slider("MAX RESULTS:", 10, 500, 50, 10)
-            st.checkbox("Include Product Reviews", value=True)
-            st.checkbox("Include Product Images", value=False)
+        if website == "Amazon":
+            num_pages = st.number_input(
+                "Number of Pages to Scrape:",
+                min_value=1,
+                max_value=20,
+                step=1
+            )
+        else:
+            num_pages = 1
         
-        if st.button("🚀 LAUNCH SCRAPER", type="primary"):
-            st.session_state.run_scraper = True
+        if st.button("🚀 LAUNCH SCRAPER", type="primary") and query:
+            if not st.session_state.scraping_in_progress:
+                # Start scraping in a separate thread
+                thread = threading.Thread(target=run_scraper, args=(query, num_pages))
+                thread.start()
     
     else:
         uploaded_file = st.file_uploader(
@@ -207,171 +200,97 @@ with st.sidebar:
         )
 
 # ---------------------------
-# Main Content Area (more compact)
+# Main Content Area
 # ---------------------------
-if data_source == "🌐 Web Scraper" and st.session_state.get('run_scraper', False):
-    # Compact progress animation
-    with st.container():
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for percent in range(101):
-            time.sleep(0.02)
-            progress_bar.progress(percent)
-            status_text.text(f"🚀 Scraping {website} for '{query}'... {percent}%")
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        # Generate and display sample data
-        sample_data = generate_sample_data(query, website)
-        
-        # Main data card with tabs - more compact
-        with st.container():
-            st.markdown(f"""
-                <div class="card">
-                    <h3 style="margin-bottom: 0.5rem;">📊 {website} Results for: "{query}"</h3>
-                    <p style="margin-bottom: 0;">{len(sample_data)} products found • Updated: {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            tab1, tab2, tab3 = st.tabs(["📋 Data Table", "📈 Insights", "📌 Highlights"])
-            
-            with tab1:
-                st.dataframe(
-                    sample_data,
-                    column_config={
-                        "Price (₹)": st.column_config.NumberColumn(format="₹%,d"),
-                        "Rating": st.column_config.ProgressColumn(format="%.1f ★", min_value=0, max_value=5),
-                        "Discount %": st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100)
-                    },
-                    hide_index=True,
-                    use_container_width=True
-                )
-                
-                st.download_button(
-                    label="📥 Download Full Dataset",
-                    data=sample_data.to_csv(index=False).encode('utf-8'),
-                    file_name=f"{website.lower()}_{query.replace(' ', '_')}.csv",
-                    mime='text/csv'
-                )
-            
-            with tab2:
-                col1, col2 = st.columns(2)
-                with col1:
-                    # Price distribution
-                    fig1 = px.histogram(
-                        sample_data, 
-                        x="Price (₹)", 
-                        nbins=10,
-                        title="Price Distribution",
-                        color_discrete_sequence=['#00d4ff']
-                    )
-                    st.plotly_chart(fig1, use_container_width=True)
-                
-                with col2:
-                    # Rating vs Price scatter
-                    fig2 = px.scatter(
-                        sample_data,
-                        x="Price (₹)",
-                        y="Rating",
-                        color="Seller",
-                        size="Reviews",
-                        hover_name="Product",
-                        title="Price vs Rating by Seller",
-                        color_discrete_sequence=['#00d4ff', '#ff00e4', '#00ffaa']
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
-            
-            with tab3:
-                # Key metrics in a tight row
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Avg Price", f"₹{int(sample_data['Price (₹)'].mean()):,}")
-                col2.metric("Avg Rating", f"{sample_data['Rating'].mean():.1f} ★")
-                col3.metric("Total Reviews", f"{sample_data['Reviews'].sum():,}")
-                
-                # Best deals with compact layout
-                st.markdown("#### 💰 Best Deals")
-                best_deals = sample_data.sort_values(by=["Discount %", "Rating"], ascending=[False, False]).head(3)
-                st.dataframe(
-                    best_deals[["Product", "Price (₹)", "Discount %", "Rating"]],
-                    hide_index=True,
-                    use_container_width=True,
-                    height=150
-                )
+if st.session_state.scraping_in_progress:
+    st.header("Scraping in Progress")
+    st.info("Please wait while we scrape data from Amazon. This may take several minutes.")
+    
+    # Progress bar
+    progress_bar = st.progress(st.session_state.progress)
+    
+    # Update progress bar in a loop while scraping
+    while st.session_state.scraping_in_progress and st.session_state.progress < 100:
+        time.sleep(0.1)
+        progress_bar.progress(st.session_state.progress)
+    
+    progress_bar.progress(100)
 
-elif data_source == "📁 Upload CSV" and uploaded_file is not None:
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            data = pd.read_csv(uploaded_file)
-        else:
-            data = pd.read_excel(uploaded_file)
+elif st.session_state.scraping_complete and st.session_state.scraped_data is not None:
+    st.header("Scraping Complete!")
+    st.success("Data has been successfully scraped and saved to the data folder.")
+    
+    # Display the scraped data
+    st.subheader("Preview of Scraped Data")
+    st.dataframe(st.session_state.scraped_data.head(10))
+    
+    # Show basic statistics
+    st.subheader("Data Overview")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Products", len(st.session_state.scraped_data))
+    with col2:
+        st.metric("Columns", len(st.session_state.scraped_data.columns))
+    with col3:
+        # Check if price column exists
+        price_col = None
+        for col in st.session_state.scraped_data.columns:
+            if 'price' in col.lower() or 'current' in col.lower():
+                price_col = col
+                break
         
-        # Compact data preview
-        with st.container():
-            st.markdown("""
-                <div class="card">
-                    <h3 style="margin-bottom: 0.5rem;">📋 Uploaded Dataset Overview</h3>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            st.dataframe(data.head(8), use_container_width=True, height=300)
-            
-    except Exception as e:
-        st.error(f"❌ Error processing file: {str(e)}")
+        if price_col:
+            try:
+                avg_price = st.session_state.scraped_data[price_col].replace('', np.nan).dropna().astype(float).mean()
+                st.metric("Average Price", f"₹{avg_price:.2f}")
+            except:
+                st.metric("Average Price", "N/A")
+        else:
+            st.metric("Average Price", "N/A")
+    
+    # Option to download the data
+    csv = st.session_state.scraped_data.to_csv(index=False)
+    st.download_button(
+        label="Download CSV",
+        data=csv,
+        file_name=f"amazon_{query}_products.csv",
+        mime="text/csv",
+    )
 
 else:
-    # Welcome section with compact layout
+    # Default view when no scraping has been done
+    st.header("Welcome to Insightify")
     st.markdown("""
-        <div class="card">
-            <h3 style="margin-bottom: 0.5rem;">🚀 Welcome to Insightify</h3>
-            <p style="margin-bottom: 0;">Transform raw data into actionable insights with our AI-powered analytics platform.</p>
-        </div>
+    <div class="card">
+        <h3>📊 Data Analytics Platform</h3>
+        <p>Use the sidebar to:</p>
+        <ul>
+            <li>Scrape data from e-commerce platforms</li>
+            <li>Upload your own datasets</li>
+            <li>Analyze and visualize data</li>
+            <li>Generate insights and reports</li>
+        </ul>
+    </div>
     """, unsafe_allow_html=True)
     
-    # Feature cards in tight grid
-    features = [
-        ("🔍", "Smart Scraping", "Extract data from e-commerce sites with intelligent pagination"),
-        ("📊", "Visual Analytics", "Interactive dashboards with Plotly charts for exploration"),
-        ("🤖", "AI Insights", "Automated trend detection and predictive analytics")
-    ]
-    
-    cols = st.columns(3)
-    for i, (icon, title, desc) in enumerate(features):
-        with cols[i]:
-            st.markdown(f"""
-                <div class="card" style="height: 100%;">
-                    <h4 style="margin-bottom: 0.25rem;">{icon} {title}</h4>
-                    <p style="margin-bottom: 0;">{desc}</p>
-                </div>
-            """, unsafe_allow_html=True)
-    
-    # Compact quick start guide
-    with st.expander("🎯 Quick Start Demo", expanded=True):
-        st.markdown("""
-            1. Select **🌐 Web Scraper** in the sidebar  
-            2. Choose a platform (e.g. Amazon)  
-            3. Enter a product (e.g. "Smartwatch")  
-            4. Click **🚀 LAUNCH SCRAPER**  
-            
-            Or try our sample dataset now:
-        """)
+    # Display recent data files if they exist
+    data_dir = "data"
+    if os.path.exists(data_dir) and os.listdir(data_dir):
+        st.subheader("Recently Scraped Data Files")
+        recent_files = []
+        for file in os.listdir(data_dir):
+            if file.endswith('.csv'):
+                file_path = os.path.join(data_dir, file)
+                mod_time = os.path.getmtime(file_path)
+                recent_files.append((file, mod_time))
         
-        if st.button("✨ Load Sample Smartwatch Data", type="primary"):
-            sample_data = generate_sample_data("Smartwatch", "Amazon")
-            st.session_state.sample_data = sample_data
-            st.session_state.show_sample = True
-            st.rerun()
-    
-    if st.session_state.get('show_sample', False):
-        st.markdown("---")
-        st.markdown("### 📊 Sample Smartwatch Data (Amazon)")
-        st.dataframe(st.session_state.sample_data, use_container_width=True, height=300)
-
-# Minimal footer
-st.markdown("---")
-st.markdown("""
-    <div style="text-align: center; color: #666; font-size: 0.8rem; padding: 0.75rem 0;">
-        © 2023 Insightify | Powered by AI | v2.1
-    </div>
-""", unsafe_allow_html=True)
+        # Sort by modification time (newest first)
+        recent_files.sort(key=lambda x: x[1], reverse=True)
+        
+        for file, mod_time in recent_files[:5]:  # Show only 5 most recent
+            file_date = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write(f"📄 {file}")
+            with col2:
+                st.write(f"_{file_date}_")

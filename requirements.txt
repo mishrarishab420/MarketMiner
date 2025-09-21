@@ -5,10 +5,7 @@ numpy
 
 # ---- Scraping ----
 requests
-beautifulsoup4
-lxml
-selenium
-undetected-chromedriver
+scrapy
 
 # ---- Visualization ----
 plotly
@@ -19,7 +16,7 @@ altair
 # ---- Excel / CSV Handling ----
 openpyxl
 xlsxwriter
-
+csv
 # ---- Utilities ----
 tqdm
 python-dotenv
