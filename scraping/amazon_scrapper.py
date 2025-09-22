@@ -1,5 +1,4 @@
 import scrapy
-import pandas as pd
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
@@ -8,38 +7,29 @@ import re
 import random
 import time
 from collections import defaultdict
-import os
 
 class AmazonSpider(scrapy.Spider):
     name = 'amazon_spider'
     
-    def __init__(self, query='laptop', pages=5, progress_callback=None, *args, **kwargs):
+    def __init__(self, query='laptop', pages=5, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.query = query
-        self.progress_callback = progress_callback  # Store the progress callback
-        
         if pages is None or pages < 1:
             self.start_urls = []
             return
-            
         self.pages = pages
         formatted_query = query.replace(" ", "+")
         base_url = f"https://www.amazon.in/s?k={formatted_query}"
         # Append realistic params (crid, sprefix, ref can be random/static)
         params = "&crid=2K91KPZM8IIUC&sprefix=" + formatted_query + "%2Caps%2C236&ref=nb_sb_noss"
-        
         if pages >= 1:
             self.start_urls = [f"{base_url}&page=1{params}"]
         else:
             self.start_urls = []
-            
         self.product_urls = set()
         self.all_spec_keys = set()
         self.items = []
         self.scraped_count = 0
-        
-        # Estimate the number of expected items (approx 20 per page)
-        self.expected_items = self.pages * 20
         
         # User agents for rotation
         self.user_agents = [
@@ -70,10 +60,6 @@ class AmazonSpider(scrapy.Spider):
             "https://search.yahoo.com/"
         ]
     
-        # Send initial progress update if callback is provided
-        if self.progress_callback:
-            self.progress_callback(10)  # 10% - Spider initialized
-    
     def get_headers(self):
         return {
             "User-Agent": random.choice(self.user_agents),
@@ -86,60 +72,56 @@ class AmazonSpider(scrapy.Spider):
         }
     
     def start_requests(self):
-        for i, url in enumerate(self.start_urls, 1):
+        for url in self.start_urls:
             yield scrapy.Request(
                 url,
                 callback=self.parse,
                 headers=self.get_headers(),
-                meta={'page': i}
+                meta={'page': 1}
             )
     
     def parse(self, response):
         page = response.meta.get('page', 1)
-
-        product_links = response.css(
-            'div[data-component-type="s-search-result"] h2.a-size-base-plus a.a-link-normal::attr(href)'
-        ).getall()
         
-        for href in product_links:
+        product_cards = response.css('div[data-component-type="s-search-result"]')
+        for card in product_cards:
+            href = card.css('a.a-link-normal.s-link-style.a-text-normal::attr(href)').get()
             if href and ('/dp/' in href or '/gp/product/' in href):
                 product_url = self.get_product_url(href)
                 if product_url and product_url not in self.product_urls:
+                    brand_snippet = card.css('div.a-row.a-size-base.a-color-secondary h2 span::text').get()
+                    brand_from_card = self.clean_text(brand_snippet) if brand_snippet else ''
                     self.product_urls.add(product_url)
                     yield scrapy.Request(
                         product_url,
                         callback=self.parse_product,
                         headers=self.get_headers(),
                         priority=1,
-                        meta={'page': page, 'brand_from_card': ''}
+                        meta={'page': page, 'brand_from_card': brand_from_card}
                     )
         
-        # Show progress
-        print(f"URLs found: {len(self.product_urls)} | Products scraped: {self.scraped_count}", end="\r")
+        # Handle pagination
+        if page < self.pages:
+            next_page = response.css('a.s-pagination-next::attr(href)').get()
+            if next_page:
+                next_page_url = urljoin('https://www.amazon.in', next_page)
+                yield scrapy.Request(
+                    next_page_url, 
+                    callback=self.parse,
+                    headers=self.get_headers(),
+                    meta={'page': page + 1}
+                )
     
-        # Update progress based on URLs found (not scraped count)
-        if self.progress_callback:
-            # Calculate progress based on URLs found vs expected
-            progress = 10 + min(30, (len(self.product_urls) / self.expected_items) * 30)
-            self.progress_callback(int(progress))
-
-
     def get_product_url(self, href):
         """Extract actual product URL from Amazon's redirect URL"""
-        # Handle Amazon's redirect URLs
         if href.startswith('/sspa/click?'):
             parsed = urlparse(href)
             query_params = parse_qs(parsed.query)
             if 'url' in query_params:
                 actual_url = unquote(query_params['url'][0])
-                # Extract the product ID part
-                if '/dp/' in actual_url or '/gp/product/' in actual_url:
-                    return urljoin('https://www.amazon.in', actual_url.split('?')[0])
-        # Handle direct product URLs
-        elif '/dp/' in href or '/gp/product/' in href:
-            # Clean the URL by removing unnecessary parameters
-            clean_url = href.split('?')[0] if '?' in href else href
-            return urljoin('https://www.amazon.in', clean_url)
+                return urljoin('https://www.amazon.in', actual_url)
+        elif href.startswith('/'):
+            return urljoin('https://www.amazon.in', href)
         return None
     
     def clean_text(self, text, default=''):
@@ -165,20 +147,11 @@ class AmazonSpider(scrapy.Spider):
             return ''
     
     def extract_discount(self, discount_text):
-        """Extract and clean discount percentage"""
+        """Extract and clean discount percentage as numeric string (no % sign)"""
         if not discount_text:
             return ''
-        
-        # Remove any non-digit characters except minus and percentage
-        discount_text = re.sub(r'[^\d%-]', '', discount_text)
-        
-        # Remove minus sign if present
-        discount_text = discount_text.replace('-', '')
-        
-        # Ensure it ends with percentage sign
-        if discount_text and not discount_text.endswith('%'):
-            discount_text += '%'
-            
+        # Remove any non-digit characters (keep only digits)
+        discount_text = re.sub(r'[^\d]', '', discount_text)
         return discount_text
     
     def extract_rating(self, rating_text):
@@ -207,35 +180,69 @@ class AmazonSpider(scrapy.Spider):
         return ''
     
     def preprocess_data(self, item):
-        """Preprocess and clean the extracted data"""
+        """Preprocess and clean the extracted data with robust price/discount checks"""
         # Clean text fields
         for field in ['Title', 'Brand', 'MRP', 'Current Price', 'Discount', 'Rating', 'Reviews']:
             if field in item:
                 item[field] = self.clean_text(item[field])
 
-        # Process specific fields with consistent keys
-        item['MRP'] = self.extract_price(item.get('MRP', ''))
-        item['Current Price'] = self.extract_price(item.get('Current Price', ''))
-        item['Discount'] = self.extract_discount(item.get('Discount', ''))
-        item['Rating'] = self.extract_rating(item.get('Rating', ''))
-        item['Reviews'] = self.extract_reviews_count(item.get('Reviews', ''))
+        # Extract numeric values
+        mrp_val = self.extract_price(item.get('MRP', ''))
+        current_val = self.extract_price(item.get('Current Price', ''))
+        discount_val = self.extract_discount(item.get('Discount', ''))
 
+        mrp_val = int(mrp_val) if mrp_val else None
+        current_val = int(current_val) if current_val else None
+        discount_val_num = int(discount_val) if discount_val else None
+
+        # --- Custom rules ---
+        # 1. If MRP is missing but Current Price is available, set MRP = Current Price, Discount = 0
+        if (mrp_val is None or mrp_val == 0) and (current_val is not None and current_val != 0):
+            mrp_val = current_val
+            discount_val_num = 0
+        # 2. If discount is negative, set Current Price = MRP and Discount = 0
+        if (
+            discount_val_num is not None
+            and discount_val_num < 0
+            and mrp_val is not None
+        ):
+            current_val = mrp_val
+            discount_val_num = 0
+
+        # Fill missing values based on available columns
         try:
-            mrp_val = int(item['MRP']) if item['MRP'] else None
-            current_val = int(item['Current Price']) if item['Current Price'] else None
-            discount_val = int(item['Discount'].replace('%','')) if item['Discount'] else None
+            if current_val is None and mrp_val is not None and discount_val_num is not None:
+                current_val = round(mrp_val * (1 - discount_val_num / 100))
+            if discount_val_num is None and mrp_val is not None and current_val is not None and mrp_val != 0:
+                discount_val_num = round((mrp_val - current_val) / mrp_val * 100)
+            if mrp_val is None and current_val is not None and discount_val_num is not None and discount_val_num != 100:
+                mrp_val = round(current_val / (1 - discount_val_num / 100))
+        except Exception:
+            pass
 
-            if mrp_val and discount_val is not None:
-                expected_price = int(round(mrp_val * (1 - discount_val/100)))
-                if current_val:
+        # Correct Current Price if it deviates >5% from expected
+        try:
+            if mrp_val is not None and discount_val_num is not None:
+                expected_price = round(mrp_val * (1 - discount_val_num / 100))
+                if current_val is not None:
                     lower_bound = expected_price * 0.95
                     upper_bound = expected_price * 1.05
                     if not (lower_bound <= current_val <= upper_bound):
-                        item['Current Price'] = str(expected_price)
+                        current_val = expected_price
                 else:
-                    item['Current Price'] = str(expected_price)
+                    current_val = expected_price
         except Exception:
             pass
+
+        # Update item with final values
+        item['MRP'] = str(mrp_val) if mrp_val is not None else ''
+        item['Current Price'] = str(current_val) if current_val is not None else ''
+        # Discount numeric value only (no % sign)
+        item['Discount'] = str(discount_val_num) if discount_val_num is not None else ''
+
+        # Process rating and reviews as before
+        item['Rating'] = self.extract_rating(item.get('Rating', ''))
+        item['Reviews'] = self.extract_reviews_count(item.get('Reviews', ''))
 
         return item
     
@@ -243,9 +250,8 @@ class AmazonSpider(scrapy.Spider):
         try:
             # Extract basic product information
             title = response.css('span#productTitle::text').get()
-            title = self.clean_text(title) if title else ''
-            
             brand = response.meta.get('brand_from_card', '')
+            
             if not brand:
                 brand_from_specs = response.css('tr.po-brand td.a-span9 span::text').get()
                 if brand_from_specs:
@@ -295,10 +301,10 @@ class AmazonSpider(scrapy.Spider):
                         value = self.clean_text(value_element)
                         specs[key] = value
                         self.all_spec_keys.add(key)
-            
-            # Avoid duplication if brand is already extracted
-            if brand and "Brand" in specs:
-                del specs["Brand"]
+                     # Avoid duplication if brand is already extracted
+                    if brand and "Brand" in specs:
+                        del specs["Brand"]
+                    
             
             # Store the product data
             item = {
@@ -332,118 +338,96 @@ class AmazonSpider(scrapy.Spider):
         print(f"\nScraping completed. URLs: {len(self.product_urls)}, Products: {self.scraped_count}")
     
     def write_to_csv(self):
-        # Create CSV with dynamic columns based on collected specifications
-        constant_fields = ['URL', 'Title', 'Brand', 'MRP', 'Current Price', 'Discount', 'Rating', 'Reviews']
+        # Constant fields, with 'Discount %' as the column header
+        constant_fields = ['URL', 'Title', 'Brand', 'MRP', 'Current Price', 'Discount %', 'Rating', 'Reviews']
+        placeholder = 'N/A'
 
-        valid_spec_keys = []
-        threshold = max(1, int(0.4 * len(self.items)))
-        for spec_key in self.all_spec_keys:
-            count = sum(1 for item in self.items if item['specs'].get(spec_key))
-            if count >= threshold:
-                valid_spec_keys.append(spec_key)
+        # Step 1: Count non-empty entries for each spec key across all items
+        spec_counts = defaultdict(int)
+        total_items = len(self.items)
+        for item in self.items:
+            specs = item.get('specs', {})
+            for key in self.all_spec_keys:
+                value = specs.get(key, '')
+                if value and str(value).strip():
+                    spec_counts[key] += 1
 
-        fieldnames = constant_fields + sorted(valid_spec_keys)
+        # Step 2: Keep only spec keys with at least 40% non-empty data
+        threshold = int(0.4 * total_items)
+        filtered_spec_keys = sorted([k for k in self.all_spec_keys if spec_counts[k] >= threshold])
 
-        # Ensure data directory exists
-        if not os.path.exists('data'):
-            os.makedirs('data')
+        # Remove duplicate spec keys while preserving order
+        seen = set()
+        unique_filtered_spec_keys = []
+        for key in filtered_spec_keys:
+            if key not in seen:
+                unique_filtered_spec_keys.append(key)
+                seen.add(key)
 
-        filename = os.path.join('data', f'amazon_{self.query}_products.csv')
+        # Step 3: Write the CSV using these filtered keys along with constant fields (no duplicate columns)
+        fieldnames = constant_fields + unique_filtered_spec_keys
+        filename = f'amazon_{self.query}_products.csv'
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-
             for item in self.items:
-                row = {field: item.get(field, '') for field in constant_fields}
-                for spec_key in valid_spec_keys:
-                    row[spec_key] = item['specs'].get(spec_key, '')
+                # Skip rows where 'Brand' is missing or empty
+                brand_val = item.get('Brand', '')
+                if brand_val is None or str(brand_val).strip() == '':
+                    continue
+                # Fill constant fields with placeholder if missing or empty
+                row = {}
+                for field in constant_fields:
+                    # For 'Discount %', use the numeric value from 'Discount'
+                    if field == 'Discount %':
+                        val = item.get('Discount', '')
+                    else:
+                        val = item.get(field, '')
+                    if val is None or str(val).strip() == '':
+                        row[field] = placeholder
+                    else:
+                        row[field] = val
+                # Fill spec fields with placeholder if missing or empty
+                specs = item.get('specs', {}) if isinstance(item.get('specs', {}), dict) else {}
+                for key in unique_filtered_spec_keys:
+                    sval = specs.get(key, '')
+                    if sval is None or str(sval).strip() == '':
+                        row[key] = placeholder
+                    else:
+                        row[key] = sval
                 writer.writerow(row)
 
-# Add this function at the end of amazon_scrapper.py
-def scrape_amazon(query, pages, progress_callback=None):
-    """Function to scrape Amazon and return a DataFrame"""
-    # Update progress at various stages
-    if progress_callback:
-        progress_callback(10)  # 10% - Spider started
-
-    # Import here to avoid reactor issues
-    import os
-    import sys
-    from scrapy.crawler import CrawlerProcess
-    from scrapy.utils.project import get_project_settings
-    
-    # Set the SCRAPY_SETTINGS_MODULE environment variable
-    os.environ.setdefault('SCRAPY_SETTINGS_MODULE', 'scraping.settings')
-    
-    # Add the current directory to Python path
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-    
+if __name__ == "__main__":
+    # Configure Scrapy settings for maximum speed
     settings = get_project_settings()
-    # Configure settings
     settings.set('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-    settings.set('CONCURRENT_REQUESTS', 4)
-    settings.set('CONCURRENT_REQUESTS_PER_DOMAIN', 4)
-    settings.set('DOWNLOAD_DELAY', 1)
-    settings.set('AUTOTHROTTLE_ENABLED', True)
-    settings.set('AUTOTHROTTLE_START_DELAY', 1)
-    settings.set('AUTOTHROTTLE_MAX_DELAY', 3)
-    settings.set('AUTOTHROTTLE_TARGET_CONCURRENCY', 2.0)
+    settings.set('CONCURRENT_REQUESTS', 100)  # Increased significantly
+    settings.set('CONCURRENT_REQUESTS_PER_DOMAIN', 16)  # Increased
+    settings.set('DOWNLOAD_DELAY', 0)  # Remove delay
+    settings.set('AUTOTHROTTLE_ENABLED', False)  # Disable auto-throttling
+    settings.set('RANDOMIZE_DOWNLOAD_DELAY', False)  # Disable random delays
     settings.set('RETRY_ENABLED', True)
-    settings.set('RETRY_TIMES', 3)
+    settings.set('RETRY_TIMES', 2)  # Reduce retries
     settings.set('COOKIES_ENABLED', False)
-    settings.set('DOWNLOAD_TIMEOUT', 30)
-    settings.set("LOG_LEVEL", "ERROR")
+    settings.set('DOWNLOAD_TIMEOUT', 15)  # Reduce timeout
+    settings.set('LOG_LEVEL', 'ERROR')
     
-    # Use CrawlerProcess instead of CrawlerRunner for better thread compatibility
-    process = CrawlerProcess(settings)
+    # Additional performance optimizations
+    settings.set('REACTOR_THREADPOOL_MAXSIZE', 20)  # Increase thread pool
+    settings.set('DNS_TIMEOUT', 10)  # Reduce DNS timeout
+    settings.set('DOWNLOAD_MAXSIZE', 0)  # No limit on response size
+    settings.set('REDIRECT_ENABLED', True)
+    settings.set('REDIRECT_MAX_TIMES', 2)  # Reduce redirects
+    settings.set('AJAXCRAWL_ENABLED', False)  # Disable AJAX crawling
+    settings.set('TELNETCONSOLE_ENABLED', False)  # Disable telnet
     
-    # Create a custom pipeline to collect items
-    items = []
-    
-    class ItemCollectorPipeline:
-        def process_item(self, item, spider):
-            items.append(item)
-            # Update progress based on number of items collected
-            if progress_callback and hasattr(spider, 'expected_items'):
-                progress = 10 + min(80, (len(items) / spider.expected_items) * 80)
-                progress_callback(int(progress))
-            return item
-    
-    # Add the custom pipeline to settings
-    settings.set('ITEM_PIPELINES', {
-        'scraping.amazon_scrapper.ItemCollectorPipeline': 100,
-    })
-    
-    # Run the spider
-    process.crawl(AmazonSpider, query=query, pages=pages, progress_callback=progress_callback)
-    process.start()
-    
-    if progress_callback:
-        progress_callback(90)  # 90% - Scraping complete, converting to DataFrame
-    
-    # Convert items to DataFrame
-    if not items:
-        return pd.DataFrame()
-    
-    # Convert the scraped items to a DataFrame
-    df_data = []
-    for item in items:
-        row = {
-            'Product': item.get('Title', ''),
-            'Price (₹)': item.get('Current Price', ''),
-            'Rating': item.get('Rating', ''),
-            'Reviews': item.get('Reviews', ''),
-            'Brand': item.get('Brand', ''),
-            'Discount %': item.get('Discount', '').replace('%', '') if item.get('Discount') else '',
-            'MRP': item.get('MRP', ''),
-            'URL': item.get('URL', '')
-        }
-        # Add specifications as columns
-        for key, value in item.get('specs', {}).items():
-            row[key] = value
-        df_data.append(row)
-    
-    if progress_callback:
-        progress_callback(100)  # 100% - Complete
-    
-    return pd.DataFrame(df_data)
+    # Get user input
+    search_query = input("Enter search query (e.g., 'laptop'): ").strip()
+    num_pages = input("Enter number of pages to scrape (e.g., 5): ").strip()
+    if not num_pages.isdigit() or int(num_pages) < 1:
+        print("No valid page number entered. Exiting without scraping.")
+    else:
+        num_pages = int(num_pages)
+        process = CrawlerProcess(settings)
+        process.crawl(AmazonSpider, query=search_query, pages=num_pages)
+        process.start()
