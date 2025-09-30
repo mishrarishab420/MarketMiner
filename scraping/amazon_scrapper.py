@@ -366,7 +366,11 @@ class AmazonSpider(scrapy.Spider):
 
         # Step 3: Write the CSV using these filtered keys along with constant fields (no duplicate columns)
         fieldnames = constant_fields + unique_filtered_spec_keys
-        filename = f'amazon_{self.query}_products.csv'
+        import os
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = os.path.join(base_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        filename = os.path.join(data_dir, f'amazon_{self.query}_products.csv')
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
