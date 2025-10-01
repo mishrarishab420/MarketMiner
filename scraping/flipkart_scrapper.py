@@ -29,6 +29,7 @@ class FlipkartSpider(scrapy.Spider):
         self.all_spec_keys = set()
         self.items = []
         self.scraped_count = 0
+        self.current_page = 1
         
         # User agents for rotation
         self.user_agents = [
@@ -74,55 +75,99 @@ class FlipkartSpider(scrapy.Spider):
         for url in self.start_urls:
             yield scrapy.Request(
                 url,
-                callback=self.parse,
+                callback=self.parse_search_page,
                 headers=self.get_headers(),
                 meta={'page': 1}
             )
     
-    def parse(self, response):
+    def parse_search_page(self, response):
         page = response.meta.get('page', 1)
+        print(f"🔍 Scraping page {page}...")
         
-        # Extract product links - Flipkart product links (more specific selectors)
-        product_links = response.css('a[href*="/p/"]::attr(href)').getall()
+        # Extract ALL product links using multiple strategies
+        product_links = self.extract_all_product_links(response)
+        print(f"📦 Found {len(product_links)} products on page {page}")
+        
+        # Process each product link
         for link in product_links:
-            if link and '/p/' in link:
-                product_url = urljoin('https://www.flipkart.com', link)
-                if product_url not in self.product_urls:
-                    self.product_urls.add(product_url)
-                    yield scrapy.Request(
-                        product_url,
-                        callback=self.parse_product,
-                        headers=self.get_headers(),
-                        priority=1,
-                        meta={'page': page}
-                    )
-        
-        # Alternative product link selectors
-        alternative_links = response.css('a[class*="_1fQZEK"]::attr(href)').getall()
-        for link in alternative_links:
-            if link and '/p/' in link:
-                product_url = urljoin('https://www.flipkart.com', link)
-                if product_url not in self.product_urls:
-                    self.product_urls.add(product_url)
-                    yield scrapy.Request(
-                        product_url,
-                        callback=self.parse_product,
-                        headers=self.get_headers(),
-                        priority=1,
-                        meta={'page': page}
-                    )
-        
-        # Handle pagination for Flipkart
-        if page < self.pages:
-            next_page = response.css('a[class*="_1LKTO3"]::attr(href)').get()
-            if next_page:
-                next_page_url = urljoin('https://www.flipkart.com', next_page)
+            product_url = urljoin('https://www.flipkart.com', link)
+            if product_url not in self.product_urls:
+                self.product_urls.add(product_url)
                 yield scrapy.Request(
-                    next_page_url, 
-                    callback=self.parse,
+                    product_url,
+                    callback=self.parse_product,
                     headers=self.get_headers(),
-                    meta={'page': page + 1}
+                    priority=1,
+                    meta={'page': page}
                 )
+        
+        # Handle pagination - FIXED VERSION
+        if page < self.pages:
+            next_page = page + 1
+            print(f"➡️ Moving to page {next_page}...")
+            
+            # Build next page URL properly
+            next_page_url = f"https://www.flipkart.com/search?q={self.query.replace(' ', '+')}&page={next_page}"
+            
+            yield scrapy.Request(
+                next_page_url,
+                callback=self.parse_search_page,
+                headers=self.get_headers(),
+                meta={'page': next_page}
+            )
+        else:
+            print(f"✅ All {self.pages} pages processed!")
+    
+    def extract_all_product_links(self, response):
+        """Extract ALL product links using multiple strategies"""
+        all_links = []
+        
+        # Strategy 1: All links containing /p/ pattern
+        p_links = response.css('a[href*="/p/"]::attr(href)').getall()
+        all_links.extend(p_links)
+        
+        # Strategy 2: Links from common product containers
+        product_containers = [
+            'div[data-id]',
+            'div[class*="_1AtVbE"]',
+            'div[class*="_2kHMtA"]', 
+            'div[class*="_4ddWXP"]',
+            'div[class*="_1xHGtK"]',
+            'div[class*="_13oc-S"]',
+            'div[class*="tUxRFH"]'
+        ]
+        
+        for container in product_containers:
+            links = response.css(f'{container} a::attr(href)').getall()
+            all_links.extend(links)
+        
+        # Strategy 3: Direct product links with common classes
+        direct_links = response.css('a[class*="_1fQZEK"], a[class*="wjcEIp"], a[class*="s1Q9rs"], a[class*="_2UzuFa"]::attr(href)').getall()
+        all_links.extend(direct_links)
+        
+        # Strategy 4: Any link that looks like a product link
+        all_a_tags = response.css('a::attr(href)').getall()
+        for link in all_a_tags:
+            if link and ('/p/' in link or '/product/' in link):
+                all_links.append(link)
+        
+        # Clean and deduplicate links
+        clean_links = []
+        for link in all_links:
+            if link and link.startswith('/'):
+                # Remove query parameters to get clean product URL
+                clean_link = link.split('?')[0] if '?' in link else link
+                clean_links.append(clean_link)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_links = []
+        for link in clean_links:
+            if link not in seen:
+                seen.add(link)
+                unique_links.append(link)
+        
+        return unique_links
     
     def clean_text(self, text, default=''):
         """Clean and preprocess text data"""
@@ -155,14 +200,22 @@ class FlipkartSpider(scrapy.Spider):
         return discount_text
     
     def extract_rating(self, rating_text):
-        """Extract numerical rating value"""
+        """Extract numerical rating value - handles both float and integer ratings"""
         if not rating_text:
             return ''
         
-        # Extract just the numeric part
-        match = re.search(r'(\d+\.\d+)', rating_text)
+        # Extract just the numeric part (supports both integers and floats)
+        match = re.search(r'(\d+(?:\.\d+)?)', rating_text)
         if match:
-            return match.group(1)
+            rating_value = match.group(1)
+            # Convert to float and back to string to ensure consistent format
+            try:
+                # If it's an integer, add .0 to make it consistent
+                if '.' not in rating_value:
+                    return f"{rating_value}.0"
+                return rating_value
+            except ValueError:
+                return ''
         return ''
     
     def extract_reviews_count(self, reviews_text):
@@ -268,10 +321,129 @@ class FlipkartSpider(scrapy.Spider):
         
         return specs
     
+    def extract_mrp_properly(self, response):
+        """Extract MRP properly when multiple elements exist"""
+        try:
+            # Try multiple MRP selectors
+            mrp_selectors = [
+                'div.yRaY8j.A6\\+E6v::text',  # Escaped + sign
+                'div[class*="yRaY8j"]::text',
+                'div._3I9_wc::text',
+                'div._3I9_wc._2p6lqe::text'
+            ]
+            
+            all_mrp_elements = []
+            for selector in mrp_selectors:
+                elements = response.css(selector).getall()
+                all_mrp_elements.extend(elements)
+            
+            # Clean and get the highest price as MRP (usually MRP is higher)
+            mrp_prices = []
+            for mrp_text in all_mrp_elements:
+                clean_mrp = self.clean_text(mrp_text)
+                if clean_mrp:
+                    price_num = self.extract_price(clean_mrp)
+                    if price_num:
+                        mrp_prices.append(int(price_num))
+            
+            if mrp_prices:
+                # Return the highest price as MRP
+                return str(max(mrp_prices))
+            
+            return ''
+        except Exception as e:
+            print(f"Error extracting MRP: {e}")
+            return ''
+    
+    def extract_rating_properly(self, response):
+        """Extract rating with better methods - handles both float and integer ratings"""
+        try:
+            # Multiple rating selectors
+            rating_selectors = [
+                'div.XQDdHH::text',
+                'div._3LWZlK::text',
+                'span._1lRcqv::text',
+                'div[class*="rating"]::text'
+            ]
+            
+            for selector in rating_selectors:
+                rating_text = response.css(selector).get()
+                if rating_text:
+                    rating = self.extract_rating(rating_text)
+                    if rating:
+                        return rating
+            
+            # If no rating found, try to find in the rating span
+            rating_span = response.css('span.Y1HWO0 div::text').get()
+            if rating_span:
+                return self.extract_rating(rating_span)
+            
+            # NEW: Try to extract from image-based ratings (like your example)
+            # Look for div containing both number and image
+            rating_divs = response.css('div.XQDdHH')
+            for div in rating_divs:
+                # Get all text nodes within this div
+                all_text = ''.join(div.css('*::text').getall()).strip()
+                if all_text:
+                    rating = self.extract_rating(all_text)
+                    if rating:
+                        return rating
+            
+            return ''
+        except Exception as e:
+            print(f"Error extracting rating: {e}")
+            return ''
+    
+    def extract_ratings_and_reviews_separately(self, response):
+        """Extract ratings count and reviews count separately"""
+        ratings_count = ''
+        reviews_count = ''
+        
+        try:
+            # Extract from the Wphh3N span structure
+            ratings_reviews_text = response.css('span.Wphh3N span::text').getall()
+            
+            if ratings_reviews_text:
+                # Look for patterns like "855 Ratings" and "50 Reviews"
+                for text in ratings_reviews_text:
+                    clean_text = self.clean_text(text)
+                    if 'Ratings' in clean_text:
+                        # Extract numbers from ratings text
+                        ratings_count = self.extract_reviews_count(clean_text)
+                    elif 'Reviews' in clean_text:
+                        # Extract numbers from reviews text
+                        reviews_count = self.extract_reviews_count(clean_text)
+            
+            # Alternative method: direct extraction from specific spans
+            if not ratings_count:
+                ratings_span = response.css('span.Wphh3N span span:nth-child(1)::text').get()
+                if ratings_span:
+                    ratings_count = self.extract_reviews_count(ratings_span)
+            
+            if not reviews_count:
+                reviews_span = response.css('span.Wphh3N span span:nth-child(3)::text').get()
+                if reviews_span:
+                    reviews_count = self.extract_reviews_count(reviews_span)
+            
+            return ratings_count, reviews_count
+            
+        except Exception as e:
+            print(f"Error extracting ratings/reviews: {e}")
+            return '', ''
+    
+    def has_complete_pricing_data(self, item):
+        """Check if item has complete pricing data (MRP, Current Price, and Discount)"""
+        mrp = item.get('MRP', '').strip()
+        current_price = item.get('Current Price', '').strip()
+        discount = item.get('Discount', '').strip()
+        
+        # All three fields must be present and non-empty
+        return bool(mrp and current_price and discount)
+    
     def preprocess_data(self, item):
         """Preprocess and clean the extracted data with robust price/discount checks"""
         # Clean text fields
-        for field in ['Title', 'Brand', 'MRP', 'Current Price', 'Discount', 'Rating', 'Reviews']:
+        for field in ['Title', 'Brand', 'MRP', 'Current Price', 'Discount', 'Rating', 'Ratings Count', 'Reviews Count']:
             if field in item:
                 item[field] = self.clean_text(item[field])
 
@@ -331,7 +503,8 @@ class FlipkartSpider(scrapy.Spider):
 
         # Process rating and reviews as before
         item['Rating'] = self.extract_rating(item.get('Rating', ''))
-        item['Reviews'] = self.extract_reviews_count(item.get('Reviews', ''))
+        item['Ratings Count'] = self.extract_reviews_count(item.get('Ratings Count', ''))
+        item['Reviews Count'] = self.extract_reviews_count(item.get('Reviews Count', ''))
 
         return item
     
@@ -345,7 +518,8 @@ class FlipkartSpider(scrapy.Spider):
                 'span[class*="VU-ZEz"]::text',
                 'h1[class*="_6EBuvT"] span::text',
                 'h1 span::text',
-                'h1::text'
+                'h1::text',
+                'span[class*="B_NuCI"]::text'
             ]
             
             for selector in title_selectors:
@@ -362,42 +536,19 @@ class FlipkartSpider(scrapy.Spider):
                 if brand_match:
                     brand = brand_match.group(1)
             
-            # Extract rating with multiple selectors
-            rating = ''
-            rating_selectors = [
-                'div[class*="XQDdHH"]::text',
-                'div[class*="rating"]::text',
-                'span[class*="rating"]::text'
-            ]
+            # Extract rating with improved method
+            rating = self.extract_rating_properly(response)
             
-            for selector in rating_selectors:
-                rating_text = response.css(selector).get()
-                if rating_text:
-                    rating = self.extract_rating(rating_text)
-                    if rating:
-                        break
-            
-            # Extract reviews count
-            reviews = ''
-            reviews_selectors = [
-                'span[class*="Wphh3N"] span::text',
-                'span[class*="review"]::text',
-                'span[class*="Rating"]::text'
-            ]
-            
-            for selector in reviews_selectors:
-                reviews_text = response.css(selector).get()
-                if reviews_text:
-                    reviews = self.extract_reviews_count(reviews_text)
-                    if reviews:
-                        break
+            # Extract ratings count and reviews count separately
+            ratings_count, reviews_count = self.extract_ratings_and_reviews_separately(response)
             
             # Extract current price with multiple selectors
             current_price = ''
             current_price_selectors = [
                 'div[class*="Nx9bqj"]::text',
                 'div[class*="price"]::text',
-                'span[class*="price"]::text'
+                'span[class*="price"]::text',
+                'div[class*="_30jeq3"]::text'
             ]
             
             for selector in current_price_selectors:
@@ -407,27 +558,16 @@ class FlipkartSpider(scrapy.Spider):
                     if current_price:
                         break
             
-            # Extract MRP with multiple selectors
-            mrp = ''
-            mrp_selectors = [
-                'div[class*="yRaY8j"]::text',
-                'div[class*="MRP"]::text',
-                'span[class*="MRP"]::text'
-            ]
-            
-            for selector in mrp_selectors:
-                mrp_text = response.css(selector).get()
-                if mrp_text:
-                    mrp = self.clean_text(mrp_text)
-                    if mrp:
-                        break
+            # Extract MRP with improved method
+            mrp = self.extract_mrp_properly(response)
             
             # Extract discount with multiple selectors
             discount = ''
             discount_selectors = [
                 'div[class*="UkUFwK"] span::text',
                 'div[class*="discount"]::text',
-                'span[class*="discount"]::text'
+                'span[class*="discount"]::text',
+                'div[class*="_3Ay6Sb"]::text'
             ]
             
             for selector in discount_selectors:
@@ -464,7 +604,8 @@ class FlipkartSpider(scrapy.Spider):
                 'Current Price': current_price,
                 'Discount': discount,
                 'Rating': rating,
-                'Reviews': reviews,
+                'Ratings Count': ratings_count,
+                'Reviews Count': reviews_count,
                 'specs': specs
             }
             
@@ -474,27 +615,33 @@ class FlipkartSpider(scrapy.Spider):
             
             # Update scraped count and show progress
             self.scraped_count += 1
-            print(f"URLs found: {len(self.product_urls)} | Products scraped: {self.scraped_count}", end="\r")
+            print(f"✅ URLs found: {len(self.product_urls)} | Products scraped: {self.scraped_count}", end="\r")
             
             yield item
             
         except Exception as e:
-            print(f"Error parsing product: {type(e).__name__}: {e}")
+            print(f"❌ Error parsing product: {type(e).__name__}: {e}")
     
     def closed(self, reason):
         # After spider closes, write data to CSV
         self.write_to_csv()
-        print(f"\nScraping completed. URLs: {len(self.product_urls)}, Products: {self.scraped_count}")
+        print(f"\n🎉 Scraping completed! URLs: {len(self.product_urls)}, Products: {self.scraped_count}")
     
     def write_to_csv(self):
-        # Constant fields, with 'Discount %' as the column header
-        constant_fields = ['URL', 'Title', 'Brand', 'MRP', 'Current Price', 'Discount %', 'Rating', 'Reviews']
+        # Constant fields - NOW INCLUDES SEPARATE RATINGS COUNT AND REVIEWS COUNT
+        constant_fields = ['URL', 'Title', 'Brand', 'MRP', 'Current Price', 'Discount %', 'Rating', 'Ratings Count', 'Reviews Count']
         placeholder = 'N/A'
 
         # Step 1: Count non-empty entries for each spec key across all items
         spec_counts = defaultdict(int)
-        total_items = len(self.items)
-        for item in self.items:
+        
+        # Filter items to only include those with complete pricing data
+        complete_pricing_items = [item for item in self.items if self.has_complete_pricing_data(item)]
+        total_items = len(complete_pricing_items)
+        
+        print(f"📊 Total items: {len(self.items)}, Items with complete pricing: {total_items}")
+        
+        for item in complete_pricing_items:
             specs = item.get('specs', {})
             for key in self.all_spec_keys:
                 value = specs.get(key, '')
@@ -524,11 +671,22 @@ class FlipkartSpider(scrapy.Spider):
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
+            
+            items_written = 0
+            items_skipped = 0
+            
             for item in self.items:
                 # Skip rows where 'Brand' is missing or empty
                 brand_val = item.get('Brand', '')
                 if brand_val is None or str(brand_val).strip() == '':
+                    items_skipped += 1
                     continue
+                
+                # NEW: Skip rows without complete pricing data
+                if not self.has_complete_pricing_data(item):
+                    items_skipped += 1
+                    continue
+                
                 # Fill constant fields with placeholder if missing or empty
                 row = {}
                 for field in constant_fields:
@@ -541,6 +699,7 @@ class FlipkartSpider(scrapy.Spider):
                         row[field] = placeholder
                     else:
                         row[field] = val
+                
                 # Fill spec fields with placeholder if missing or empty
                 specs = item.get('specs', {}) if isinstance(item.get('specs', {}), dict) else {}
                 for key in unique_filtered_spec_keys:
@@ -549,15 +708,19 @@ class FlipkartSpider(scrapy.Spider):
                         row[key] = placeholder
                     else:
                         row[key] = sval
+                
                 writer.writerow(row)
+                items_written += 1
+            
+            print(f"📈 CSV written: {items_written} items written, {items_skipped} items skipped")
 
 if __name__ == "__main__":
-    # Configure Scrapy settings for maximum speed
+    # Configure Scrapy settings
     settings = get_project_settings()
     settings.set('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
     settings.set('CONCURRENT_REQUESTS', 100)
     settings.set('CONCURRENT_REQUESTS_PER_DOMAIN', 16)
-    settings.set('DOWNLOAD_DELAY', 0.5)  # Small delay to avoid blocking
+    settings.set('DOWNLOAD_DELAY', 0)  # Small delay to avoid blocking
     settings.set('AUTOTHROTTLE_ENABLED', False)
     settings.set('RANDOMIZE_DOWNLOAD_DELAY', False)
     settings.set('RETRY_ENABLED', True)
