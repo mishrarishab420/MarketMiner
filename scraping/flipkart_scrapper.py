@@ -399,17 +399,26 @@ class FlipkartSpider(scrapy.Spider):
         ratings_count = ''
         reviews_count = ''
         try:
-            # New structure: single span like -> <span class="Wphh3N"><span>22 ratings and 0 reviews</span></span>
-            combined_text = response.css('span.Wphh3N span::text').get()
+            # Try multiple selectors for combined text
+            combined_text_selectors = [
+                'span.Wphh3N span::text',
+                '#container div.DRxq-P div span.Wphh3N span::text'
+            ]
+            combined_text = None
+            for selector in combined_text_selectors:
+                combined_text = response.css(selector).get()
+                if combined_text:
+                    break
+
             if combined_text:
                 clean_text = self.clean_text(combined_text.lower())
 
-                # Extract ratings
+                # Extract ratings count
                 ratings_match = re.search(r'(\d[\d,]*)\s*ratings?', clean_text)
                 if ratings_match:
                     ratings_count = ratings_match.group(1).replace(',', '').strip()
 
-                # Extract reviews
+                # Extract reviews count
                 reviews_match = re.search(r'(\d[\d,]*)\s*reviews?', clean_text)
                 if reviews_match:
                     reviews_count = reviews_match.group(1).replace(',', '').strip()
