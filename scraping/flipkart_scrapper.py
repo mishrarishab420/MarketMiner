@@ -395,38 +395,27 @@ class FlipkartSpider(scrapy.Spider):
             return ''
     
     def extract_ratings_and_reviews_separately(self, response):
-        """Extract ratings count and reviews count separately"""
+        """Extract ratings count and reviews count separately from Flipkart's new structure"""
         ratings_count = ''
         reviews_count = ''
-        
         try:
-            # Extract from the Wphh3N span structure
-            ratings_reviews_text = response.css('span.Wphh3N span::text').getall()
-            
-            if ratings_reviews_text:
-                # Look for patterns like "855 Ratings" and "50 Reviews"
-                for text in ratings_reviews_text:
-                    clean_text = self.clean_text(text)
-                    if 'Ratings' in clean_text:
-                        # Extract numbers from ratings text
-                        ratings_count = self.extract_reviews_count(clean_text)
-                    elif 'Reviews' in clean_text:
-                        # Extract numbers from reviews text
-                        reviews_count = self.extract_reviews_count(clean_text)
-            
-            # Alternative method: direct extraction from specific spans
-            if not ratings_count:
-                ratings_span = response.css('span.Wphh3N span span:nth-child(1)::text').get()
-                if ratings_span:
-                    ratings_count = self.extract_reviews_count(ratings_span)
-            
-            if not reviews_count:
-                reviews_span = response.css('span.Wphh3N span span:nth-child(3)::text').get()
-                if reviews_span:
-                    reviews_count = self.extract_reviews_count(reviews_span)
-            
+            # New structure: single span like -> <span class="Wphh3N"><span>22 ratings and 0 reviews</span></span>
+            combined_text = response.css('span.Wphh3N span::text').get()
+            if combined_text:
+                clean_text = self.clean_text(combined_text.lower())
+
+                # Extract ratings
+                ratings_match = re.search(r'(\d[\d,]*)\s*ratings?', clean_text)
+                if ratings_match:
+                    ratings_count = ratings_match.group(1).replace(',', '').strip()
+
+                # Extract reviews
+                reviews_match = re.search(r'(\d[\d,]*)\s*reviews?', clean_text)
+                if reviews_match:
+                    reviews_count = reviews_match.group(1).replace(',', '').strip()
+
             return ratings_count, reviews_count
-            
+
         except Exception as e:
             print(f"Error extracting ratings/reviews: {e}")
             return '', ''
@@ -440,6 +429,35 @@ class FlipkartSpider(scrapy.Spider):
         # All three fields must be present and non-empty
         return bool(mrp and current_price and discount)
     
+    def fill_missing_numeric_fields(self, item):
+        """Ensure numeric fields are never empty. Fill missing ones with 0 or 0.0 based on type."""
+        numeric_defaults = {
+            'MRP': '0',
+            'Current Price': '0',
+            'Discount': '0',
+            'Rating': '0.0',
+            'Ratings Count': '0',
+            'Reviews Count': '0'
+        }
+
+        for field, default in numeric_defaults.items():
+            val = item.get(field, '')
+            if val is None or str(val).strip() == '':
+                item[field] = default
+        return item
+
+    def should_skip_due_to_missing_pricing(self, item):
+        """Return True if two or more of MRP, Current Price, and Discount are missing or zero."""
+        pricing_fields = ['MRP', 'Current Price', 'Discount']
+        missing_count = 0
+
+        for field in pricing_fields:
+            val = item.get(field, '').strip()
+            if not val or val in ['0', '0.0', '']:
+                missing_count += 1
+
+        return missing_count >= 2
+
     def preprocess_data(self, item):
         """Preprocess and clean the extracted data with robust price/discount checks"""
         # Clean text fields
@@ -506,6 +524,7 @@ class FlipkartSpider(scrapy.Spider):
         item['Ratings Count'] = self.extract_reviews_count(item.get('Ratings Count', ''))
         item['Reviews Count'] = self.extract_reviews_count(item.get('Reviews Count', ''))
 
+        item = self.fill_missing_numeric_fields(item)
         return item
     
     def parse_product(self, response):
@@ -627,6 +646,17 @@ class FlipkartSpider(scrapy.Spider):
         self.write_to_csv()
         print(f"\n🎉 Scraping completed! URLs: {len(self.product_urls)}, Products: {self.scraped_count}")
     
+    def remove_duplicate_columns(self, columns):
+        """Ensure no duplicate columns (case-insensitive)"""
+        seen = set()
+        unique_columns = []
+        for col in columns:
+            col_lower = col.lower()
+            if col_lower not in seen:
+                seen.add(col_lower)
+                unique_columns.append(col)
+        return unique_columns
+
     def write_to_csv(self):
         # Constant fields - NOW INCLUDES SEPARATE RATINGS COUNT AND REVIEWS COUNT
         constant_fields = ['URL', 'Title', 'Brand', 'MRP', 'Current Price', 'Discount %', 'Rating', 'Ratings Count', 'Reviews Count']
@@ -661,7 +691,7 @@ class FlipkartSpider(scrapy.Spider):
                 seen.add(key)
 
         # Step 3: Write the CSV using these filtered keys along with constant fields (no duplicate columns)
-        fieldnames = constant_fields + unique_filtered_spec_keys
+        fieldnames = self.remove_duplicate_columns(constant_fields + unique_filtered_spec_keys)
         import os
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         data_dir = os.path.join(base_dir, "data")
@@ -681,12 +711,17 @@ class FlipkartSpider(scrapy.Spider):
                 if brand_val is None or str(brand_val).strip() == '':
                     items_skipped += 1
                     continue
-                
+
                 # NEW: Skip rows without complete pricing data
                 if not self.has_complete_pricing_data(item):
                     items_skipped += 1
                     continue
-                
+
+                # Skip if 2 or more of MRP, Current Price, Discount are missing
+                if self.should_skip_due_to_missing_pricing(item):
+                    items_skipped += 1
+                    continue
+
                 # Fill constant fields with placeholder if missing or empty
                 row = {}
                 for field in constant_fields:
@@ -699,7 +734,7 @@ class FlipkartSpider(scrapy.Spider):
                         row[field] = placeholder
                     else:
                         row[field] = val
-                
+
                 # Fill spec fields with placeholder if missing or empty
                 specs = item.get('specs', {}) if isinstance(item.get('specs', {}), dict) else {}
                 for key in unique_filtered_spec_keys:
@@ -708,10 +743,10 @@ class FlipkartSpider(scrapy.Spider):
                         row[key] = placeholder
                     else:
                         row[key] = sval
-                
+
                 writer.writerow(row)
                 items_written += 1
-            
+
             print(f"📈 CSV written: {items_written} items written, {items_skipped} items skipped")
 
 if __name__ == "__main__":
