@@ -399,36 +399,59 @@ class FlipkartSpider(scrapy.Spider):
         ratings_count = ''
         reviews_count = ''
         try:
-            # Try multiple selectors for combined text
-            combined_text_selectors = [
+            # ✅ Try combined text (ratings & reviews together)
+            combined_selectors = [
+                'span.Wphh3N::text',
                 'span.Wphh3N span::text',
-                '#container div.DRxq-P div span.Wphh3N span::text'
+                'div.Wphh3N span::text',
+                'div.DRxq-P span::text',
+                'div.YJG4Cf span::text',
+                '#container span.Wphh3N span span::text',
+                '#container div.Wphh3N span span::text',
             ]
-            combined_text = None
-            for selector in combined_text_selectors:
-                combined_text = response.css(selector).get()
-                if combined_text:
-                    break
+            all_text_parts = []
+            for sel in combined_selectors:
+                all_text_parts.extend(response.css(sel).getall())
 
-            if combined_text:
-                clean_text = self.clean_text(combined_text.lower())
+            combined_text = " ".join(all_text_parts)
+            clean_text_val = self.clean_text(combined_text.lower())
 
-                # Extract ratings count
-                ratings_match = re.search(r'(\d[\d,]*)\s*ratings?', clean_text)
-                if ratings_match:
-                    ratings_count = ratings_match.group(1).replace(',', '').strip()
+            # 🔍 Extract ratings count
+            match_ratings = re.search(r'([\d,]+)\s*ratings?', clean_text_val)
+            if match_ratings:
+                ratings_count = match_ratings.group(1).replace(",", "").strip()
 
-                # Extract reviews count
-                reviews_match = re.search(r'(\d[\d,]*)\s*reviews?', clean_text)
-                if reviews_match:
-                    reviews_count = reviews_match.group(1).replace(',', '').strip()
+            # 🔍 Extract reviews count
+            match_reviews = re.search(r'([\d,]+)\s*reviews?', clean_text_val)
+            if match_reviews:
+                reviews_count = match_reviews.group(1).replace(",", "").strip()
+
+            # ✅ Extra fallback for separated spans (new Flipkart DOM)
+            if not reviews_count:
+                review_selectors = [
+                    '#container span.Wphh3N span span:nth-child(3)::text',
+                    'div.Wphh3N span:nth-child(3)::text',
+                    'div.DOjaWF div.Wphh3N span:nth-child(3)::text'
+                ]
+                for sel in review_selectors:
+                    review_text = response.css(sel).get()
+                    if review_text:
+                        reviews_count = self.extract_reviews_count(review_text)
+                        if reviews_count:
+                            break
+
+            # ✅ As final fallback, look for plain text "reviews" anywhere
+            if not reviews_count:
+                generic_text = " ".join(response.css('*::text').getall())
+                match_generic = re.search(r'([\d,]+)\s*reviews?', generic_text.lower())
+                if match_generic:
+                    reviews_count = match_generic.group(1).replace(",", "").strip()
 
             return ratings_count, reviews_count
 
         except Exception as e:
             print(f"Error extracting ratings/reviews: {e}")
             return '', ''
-    
     def has_complete_pricing_data(self, item):
         """Check if item has complete pricing data (MRP, Current Price, and Discount)"""
         mrp = item.get('MRP', '').strip()
