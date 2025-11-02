@@ -336,6 +336,173 @@ class AmazonSpider(scrapy.Spider):
         # After spider closes, write data to CSV
         self.write_to_csv()
         print(f"\nScraping completed. URLs: {len(self.product_urls)}, Products: {self.scraped_count}")
+        # Clean and save cleaned data
+        self.clean_and_save_csv()
+        print(f"Data cleaning and saving to cleaned CSV completed.")
+
+    def clean_and_save_csv(self):
+        """
+        Cleans the scraped data, handles missing values, recalculates price/discount,
+        standardizes numeric fields, and saves the cleaned data to CSV.
+        """
+        import os
+        import copy
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = os.path.join(base_dir, "data", "cleaned")
+        os.makedirs(data_dir, exist_ok=True)
+        filename = os.path.join(data_dir, f'amazon_{self.query}_products_cleaned.csv')
+
+        # Constant fields, with 'Discount %' as the column header
+        constant_fields = ['URL', 'Title', 'Brand', 'MRP', 'Current Price', 'Discount %', 'Rating', 'Reviews']
+        placeholder = 'N/A'
+
+        # Step 1: Count non-empty entries for each spec key across all items
+        spec_counts = defaultdict(int)
+        total_items = len(self.items)
+        for item in self.items:
+            specs = item.get('specs', {})
+            for key in self.all_spec_keys:
+                value = specs.get(key, '')
+                if value and str(value).strip():
+                    spec_counts[key] += 1
+
+        # Step 2: Keep only spec keys with at least 40% non-empty data
+        threshold = int(0.4 * total_items)
+        filtered_spec_keys = sorted([k for k in self.all_spec_keys if spec_counts[k] >= threshold])
+
+        # Remove duplicate spec keys while preserving order
+        seen = set()
+        unique_filtered_spec_keys = []
+        for key in filtered_spec_keys:
+            if key not in seen:
+                unique_filtered_spec_keys.append(key)
+                seen.add(key)
+
+        # Step 3: Clean and write the CSV using these filtered keys along with constant fields (no duplicate columns)
+        fieldnames = constant_fields + unique_filtered_spec_keys
+        cleaned_rows = []
+        for item in self.items:
+            # Skip rows where 'Brand' is missing or empty
+            brand_val = item.get('Brand', '')
+            if brand_val is None or str(brand_val).strip() == '':
+                continue
+            # Copy item to avoid mutating original
+            clean_item = copy.deepcopy(item)
+            # Clean constant fields and handle missing values
+            for field in ['Title', 'Brand', 'MRP', 'Current Price', 'Discount', 'Rating', 'Reviews']:
+                val = clean_item.get(field, '')
+                if val is None or str(val).strip() == '':
+                    clean_item[field] = placeholder
+            # Clean specs
+            clean_specs = {}
+            specs = clean_item.get('specs', {}) if isinstance(clean_item.get('specs', {}), dict) else {}
+            for key in unique_filtered_spec_keys:
+                sval = specs.get(key, '')
+                if sval is None or str(sval).strip() == '':
+                    clean_specs[key] = placeholder
+                else:
+                    clean_specs[key] = sval
+            # Recalculate/standardize price and discount if possible
+            # Extract numeric values
+            def extract_price(price_text):
+                if not price_text or price_text == placeholder:
+                    return None
+                pt = re.sub(r'[^\d.]', '', price_text)
+                try:
+                    return int(float(pt))
+                except Exception:
+                    return None
+            def extract_discount(discount_text):
+                if not discount_text or discount_text == placeholder:
+                    return None
+                dt = re.sub(r'[^\d]', '', discount_text)
+                try:
+                    return int(dt)
+                except Exception:
+                    return None
+            mrp_val = extract_price(clean_item.get('MRP', ''))
+            current_val = extract_price(clean_item.get('Current Price', ''))
+            discount_val = extract_discount(clean_item.get('Discount', ''))
+            # 1. If MRP is missing but Current Price is available, set MRP = Current Price, Discount = 0
+            if (mrp_val is None or mrp_val == 0) and (current_val is not None and current_val != 0):
+                mrp_val = current_val
+                discount_val = 0
+            # 2. If discount is negative, set Current Price = MRP and Discount = 0
+            if discount_val is not None and discount_val < 0 and mrp_val is not None:
+                current_val = mrp_val
+                discount_val = 0
+            # Fill missing values based on available columns
+            try:
+                if current_val is None and mrp_val is not None and discount_val is not None:
+                    current_val = round(mrp_val * (1 - discount_val / 100))
+                if discount_val is None and mrp_val is not None and current_val is not None and mrp_val != 0:
+                    discount_val = round((mrp_val - current_val) / mrp_val * 100)
+                if mrp_val is None and current_val is not None and discount_val is not None and discount_val != 100:
+                    mrp_val = round(current_val / (1 - discount_val / 100))
+            except Exception:
+                pass
+            # Correct Current Price if it deviates >5% from expected
+            try:
+                if mrp_val is not None and discount_val is not None:
+                    expected_price = round(mrp_val * (1 - discount_val / 100))
+                    if current_val is not None:
+                        lower_bound = expected_price * 0.95
+                        upper_bound = expected_price * 1.05
+                        if not (lower_bound <= current_val <= upper_bound):
+                            current_val = expected_price
+                    else:
+                        current_val = expected_price
+            except Exception:
+                pass
+            # Update clean_item with final values
+            clean_item['MRP'] = str(mrp_val) if mrp_val is not None else placeholder
+            clean_item['Current Price'] = str(current_val) if current_val is not None else placeholder
+            clean_item['Discount'] = str(discount_val) if discount_val is not None else placeholder
+            # Rating and Reviews: extract numeric part or set placeholder
+            def extract_rating(rating_text):
+                if not rating_text or rating_text == placeholder:
+                    return placeholder
+                match = re.search(r'(\d+\.\d+)', rating_text)
+                if match:
+                    return match.group(1)
+                return placeholder
+            def extract_reviews_count(reviews_text):
+                if not reviews_text or reviews_text == placeholder:
+                    return placeholder
+                numbers = re.findall(r'[\d,]+', reviews_text)
+                if numbers:
+                    try:
+                        return numbers[0].replace(',', '')
+                    except Exception:
+                        return placeholder
+                return placeholder
+            clean_item['Rating'] = extract_rating(clean_item.get('Rating', ''))
+            clean_item['Reviews'] = extract_reviews_count(clean_item.get('Reviews', ''))
+            # Build the row for CSV
+            row = {}
+            for field in constant_fields:
+                if field == 'Discount %':
+                    val = clean_item.get('Discount', '')
+                else:
+                    val = clean_item.get(field, '')
+                if val is None or str(val).strip() == '':
+                    row[field] = placeholder
+                else:
+                    row[field] = val
+            for key in unique_filtered_spec_keys:
+                sval = clean_specs.get(key, '')
+                if sval is None or str(sval).strip() == '':
+                    row[key] = placeholder
+                else:
+                    row[key] = sval
+            cleaned_rows.append(row)
+
+        # Save to cleaned CSV
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in cleaned_rows:
+                writer.writerow(row)
     
     def write_to_csv(self):
         # Constant fields, with 'Discount %' as the column header
