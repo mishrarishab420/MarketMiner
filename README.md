@@ -1,1 +1,1 @@
-# iNSIGHTIFY
+# MarketMiner
